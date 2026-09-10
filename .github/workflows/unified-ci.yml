@@ -589,7 +589,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Notify Feishu (optional)
-        if: steps.count.outputs.count != '0' && secrets.FEISHU_WEBHOOK_URL != ''
+        if: steps.count.outputs.count != '0'
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
           REPO: ${{ github.repository }}
@@ -599,6 +599,11 @@ jobs:
           COMMIT_URL: ${{ github.event.head_commit.url }}
           REVIEW: ${{ steps.review.outputs.review }}
         run: |
+          if [ -z "$FEISHU_WEBHOOK_URL" ]; then
+            echo "FEISHU_WEBHOOK_URL not set; skipping Feishu notification"
+            exit 0
+          fi
+
           SHORT_SHA="${COMMIT_ID:0:7}"
           PAYLOAD=$(jq -n \
             --arg repo "$REPO" \
