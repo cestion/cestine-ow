@@ -7,13 +7,16 @@
  *   2. Reverse-dependency fan-out — who imports it (via madge)
  *   3. Categorization: route / component / hook / store / provider / util / api / other
  *
+ * Covers the whole first-party codebase (src/, scripts/, root configs, CI,
+ * infra), not just src/ — a change to vite.config.ts or a workflow can matter
+ * as much as a component change.
+ *
  * Emits Markdown to stdout, consumed by the pr-analysis.yml workflow as a
  * sticky PR comment.
  */
 
 import { execSync } from "node:child_process"
-import { existsSync, readFileSync } from "node:fs"
-import { basename, dirname, relative, resolve } from "node:path"
+import { dirname, relative, resolve } from "node:path"
 
 const ROOT = process.cwd()
 const SRC = resolve(ROOT, "src")
@@ -28,6 +31,41 @@ if (!BASE_SHA || !HEAD_SHA) {
 }
 
 // ---------------------------------------------------------------------------
+// 0. Scope — what counts as "first-party source we care about"
+// ---------------------------------------------------------------------------
+
+/** Extensions we analyze (TS/JS + config formats that affect the build). */
+const SOURCE_EXT = /\.(ts|tsx|js|jsx|mjs|cjs)$/
+const CONFIG_FILE =
+  /^(package\.json|pnpm-workspace\.yaml|tsconfig[.\w-]*\.json|vite\.config\.\w+|biome\.json|orval\.config\.\w+|codama\.json|Dockerfile|\.env\.\w+|sonar-project\.properties)$/
+
+/** Generated / vendored / build-output paths excluded from analysis. */
+const EXCLUDED = [
+  /^node_modules\//,
+  /^dist\//,
+  /^\.output\//,
+  /^coverage\//,
+  /^\.git\//,
+  /^src\/api\/__generated__\//,
+  /^src\/solana\//,
+  /^src\/routeTree\.gen\.ts$/,
+  /^pnpm-lock\.yaml$/,
+  /\.backup$/,
+]
+
+/** Directories scanned by madge for the reverse-dependency graph. */
+const MADGE_SCAN_DIRS = ["src/", "scripts/"]
+
+function isInteresting(file: string): boolean {
+  if (EXCLUDED.some((re) => re.test(file))) return false
+  // Root-level config artifacts (Dockerfile, CI, infra, tsconfig, ...)
+  if (/^(\.github\/|aws\/)/.test(file)) return true
+  if (!file.includes("/") && CONFIG_FILE.test(file)) return true
+  // Any TS/JS source anywhere in the repo
+  return SOURCE_EXT.test(file)
+}
+
+// ---------------------------------------------------------------------------
 // 1. Changed files
 // ---------------------------------------------------------------------------
 
@@ -38,9 +76,7 @@ function getChangedFiles(): string[] {
   return out
     .split("\n")
     .map((f) => f.trim())
-    .filter((f) => f && (f.endsWith(".ts") || f.endsWith(".tsx")))
-    .filter((f) => f.startsWith("src/"))
-    .filter((f) => !f.includes("__generated__") && !f.includes("routeTree.gen"))
+    .filter((f) => f && isInteresting(f))
 }
 
 // ---------------------------------------------------------------------------
@@ -58,6 +94,11 @@ type Category =
   | "feature"
   | "layout"
   | "lib"
+  | "script"
+  | "build"
+  | "ci"
+  | "infra"
+  | "config"
   | "other"
 
 function categorize(file: string): Category {
@@ -71,6 +112,12 @@ function categorize(file: string): Category {
   if (file.startsWith("src/api/")) return "api"
   if (file.startsWith("src/utils/")) return "util"
   if (file.startsWith("src/lib/")) return "lib"
+  if (file.startsWith("scripts/")) return "script"
+  if (file.startsWith(".github/")) return "ci"
+  if (file.startsWith("aws/")) return "infra"
+  if (file === "Dockerfile" || file.startsWith("vite.config") || file.startsWith("orval.config"))
+    return "build"
+  if (!file.includes("/") && CONFIG_FILE.test(file)) return "config"
   return "other"
 }
 
@@ -85,6 +132,11 @@ const CATEGORY_ICON: Record<Category, string> = {
   feature: "✨",
   layout: "📐",
   lib: "📚",
+  script: "📜",
+  build: "🔨",
+  ci: "⚙️",
+  infra: "☁️",
+  config: "📋",
   other: "📄",
 }
 
@@ -111,11 +163,17 @@ function inferRouteFromRoutesDir(file: string): string {
 
 let depTreeCache: Record<string, string[]> | null = null
 
+/**
+ * Scan roots for madge. It keys its JSON output by path relative to cwd, so
+ * our `reverseDeps` path math below is prefix-agnostic.
+ */
+const MADGE_SCAN_ARGS = MADGE_SCAN_DIRS.join(" ")
+
 function loadDepTree(): Record<string, string[]> {
   if (depTreeCache) return depTreeCache
   try {
     const raw = execSync(
-      `npx --no madge --extensions ts,tsx --ts-config tsconfig.json --json src/`,
+      `npx --no madge --extensions ts,tsx --ts-config tsconfig.json --json ${MADGE_SCAN_ARGS}`,
       { encoding: "utf8", maxBuffer: 100 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] },
     )
     depTreeCache = JSON.parse(raw)
@@ -128,11 +186,16 @@ function loadDepTree(): Record<string, string[]> {
 /** Find which files import `target` (transitive one hop). */
 function reverseDeps(target: string): string[] {
   const tree = loadDepTree()
-  // madge returns keys relative to the scanned root ('src/')
-  const key = target.startsWith("src/") ? target.slice("src/".length) : target
+  // Non-TS/JS files (Dockerfile, workflows, JSON) aren't in the dependency
+  // graph at all — nothing imports them, so fan-out is meaningfully zero.
+  if (!SOURCE_EXT.test(target)) return []
+
+  // madge returns keys relative to the scanned root ('src/', 'scripts/'),
+  // and resolves aliases (@/…) or relative specifiers to those keys.
+  const key = target.replace(/^(src|scripts)\//, "")
   const results: string[] = []
   for (const [importer, imports] of Object.entries(tree)) {
-    if (imports.includes(key)) results.push("src/" + importer)
+    if (imports.includes(key)) results.push(importer)
   }
   return results
 }

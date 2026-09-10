@@ -178,18 +178,20 @@ jobs:
           echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
           echo "Analyzing $BASE_SHA..$HEAD_SHA"
 
-      - name: Count changed source files
+      - name: Count changed files
         id: count
         env:
           BASE_SHA: ${{ steps.refs.outputs.base }}
           HEAD_SHA: ${{ steps.refs.outputs.head }}
         run: |
+          # 全量第一方代码:src/ scripts/ 根配置 .github/ aws/ Dockerfile 等
           COUNT=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" \
-            | grep -E '^src/.*\.(ts|tsx)$' \
-            | grep -vE 'src/api/__generated__/|src/solana/|routeTree\.gen\.ts' \
+            | grep -vE '^(node_modules|dist|\.output|coverage)/' \
+            | grep -vE '^(src/api/__generated__|src/solana)/|^src/routeTree\.gen\.ts$|^pnpm-lock\.yaml$' \
+            | grep -E '\.(ts|tsx|js|jsx|mjs|cjs)$|^(\.github/|aws/)|^[^/]*\.(json|yaml|yml|properties)$|^[^/]*Dockerfile$' \
             | wc -l | tr -d ' ')
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
-          echo "Changed source files: $COUNT"
+          echo "Changed files: $COUNT"
 
       - name: Install deps (only if we have work to do)
         if: steps.count.outputs.count != '0'
@@ -213,8 +215,16 @@ jobs:
           HEAD_SHA: ${{ steps.refs.outputs.head }}
         run: |
           git diff --stat "$BASE_SHA" "$HEAD_SHA" > diff-stat.txt
+          # 全量第一方代码;仅排除生成代码与锁文件
           git diff --unified=3 "$BASE_SHA" "$HEAD_SHA" \
-            -- 'src/**' ':(exclude)src/api/__generated__/**' ':(exclude)src/solana/**' ':(exclude)src/routeTree.gen.ts' \
+            -- ':/' \
+            ':(exclude)src/api/__generated__/**' \
+            ':(exclude)src/solana/**' \
+            ':(exclude)src/routeTree.gen.ts' \
+            ':(exclude)pnpm-lock.yaml' \
+            ':(exclude)node_modules/**' \
+            ':(exclude).output/**' \
+            ':(exclude)dist/**' \
             | head -c 120000 > diff-truncated.patch
 
       - name: Call MiniMax-M3
@@ -249,15 +259,15 @@ jobs:
 
           **💼 业务影响** — 从终端用户视角说明:改动波及了哪些业务模块?对应的用户流程可能出现什么变化(如无法进入某页面、操作行为不同、数据展示错误、支付/发放异常)?按业务优先级排序,最多 4 条,每条格式 `- **[模块名]** — 具体影响`。若只改基础设施/工具代码,直接说 "无直接业务影响"。
 
-          **🔥 技术影响范围** — 波及的技术表面(路由、共享模块、hooks、stores 等)。
+          **🔥 技术影响范围** — 波及的技术表面(路由、共享模块、hooks、stores、构建配置、CI、基础设施等)。
 
-          **⚠️ 回归风险** — 可能坏的具体场景,按严重度排序,最多 4 条。
+          **⚠️ 回归风险** — 可能坏的具体场景,按严重度排序,最多 4 条。注意构建配置(vite.config.ts、tsconfig、Dockerfile、依赖锁)与 CI workflow 的改动能影响整个构建/部署,不要因为是"非业务代码"就低估。
 
           **🧪 测试盲区** — 引用具体文件。
 
           **✅ 自查清单** — 3-5 条 push 前该验证的项目。
 
-          要求:控制在 800 字以内,飞书卡片渲染友好,引用文件路径和函数名。
+          要求:控制在 800 字以内,飞书卡片渲染友好,引用文件路径和函数名。改动可能涉及 src/ 之外的代码(scripts/、根配置文件、.github/workflows、aws/、Dockerfile 等),请一并评估。
 
           # 业务模块清单(供业务影响判断参考)
           - **创作(create)** — src/features/create, create-short-video
@@ -275,6 +285,11 @@ jobs:
           - **API 层** — src/api(所有业务接口)
           - **Solana 链上** — src/solana(钱包/代币/链上)
           - **鉴权** — @privy-io/react-auth, src/providers
+          # 非业务代码(同样纳入评估)
+          - **构建配置** — vite.config.ts, tsconfig*.json, orval.config.ts, package.json, Dockerfile
+          - **工具脚本** — scripts/(影响分析、i18n、资源优化、版本注入)
+          - **CI/CD** — .github/workflows/
+          - **基础设施** — aws/(CloudFormation)
           PROMPT_EOF
           SYSTEM=$(sed 's/^          //' /tmp/system-prompt.txt)
 
@@ -349,7 +364,7 @@ jobs:
           SHORT_SHA="${COMMIT_ID:0:7}"
 
           if [ "${CHANGED:-0}" = "0" ]; then
-            BODY="_本次推送未修改 src/ 下的 TypeScript 源码,已跳过 AI 分析。_"
+            BODY="_本次推送未修改代码或配置文件,已跳过 AI 分析。_"
             TEMPLATE="grey"
             TITLE="🤖 分支变更 AI 分析(跳过)"
           elif [ -z "$ASSESSMENT" ]; then
@@ -624,15 +639,15 @@ jobs:
 
           **💼 业务影响** — 从终端用户视角说明:改动波及了哪些业务模块(参考业务清单,如创作、演员、剧本、观看、收益、邀请、UGC、社交、内购、挖矿等)?对应的用户流程可能出现什么变化(如无法进入某个页面、某个操作行为不同、数据展示错误、支付/发放异常)?按业务优先级排序,最多 5 条,每条格式为 `- **[模块名]** — 具体影响`。如果只改基础设施/工具代码没有直接业务影响,明确说 "无直接业务影响"。
 
-          **🔥 技术影响范围** — 波及的技术表面(路由、共享模块、hooks、stores、providers 等)。
+          **🔥 技术影响范围** — 波及的技术表面(路由、共享模块、hooks、stores、providers、构建配置、CI、基础设施等)。
 
-          **⚠️ 回归风险** — 具体可能坏的场景,按严重度排序,最多 5 条。
+          **⚠️ 回归风险** — 具体可能坏的场景,按严重度排序,最多 5 条。注意构建配置(vite.config.ts、tsconfig、Dockerfile、依赖)与 CI/基础设施改动能影响整个构建与部署。
 
           **🧪 测试盲区** — 未覆盖的路径,引用具体文件。
 
           **✅ Reviewer checklist** — 合并前必须验证的 3-6 项。
 
-          要求:引用具体文件路径和函数名;若 diff 看起来安全,直言无风险;不要重复静态报告的内容,要在其上增加信号。
+          要求:引用具体文件路径和函数名;若 diff 看起来安全,直言无风险;不要重复静态报告的内容,要在其上增加信号。改动可能涉及 src/ 之外的代码(scripts/、根配置文件、.github/workflows、aws/、Dockerfile 等),请一并评估。
 
           # 业务模块清单(供业务影响判断参考)
           - **创作(create)** — src/features/create, src/routes/create.tsx, create-short-video
@@ -656,6 +671,11 @@ jobs:
           - **API 层** — src/api(所有业务接口)
           - **Solana 链上交互** — src/solana(钱包、代币、链上操作)
           - **鉴权/Privy** — @privy-io/react-auth 相关,src/providers
+          # 非业务代码(同样纳入评估)
+          - **构建配置** — vite.config.ts, tsconfig*.json, orval.config.ts, package.json, Dockerfile
+          - **工具脚本** — scripts/(影响分析、i18n、资源优化、版本注入)
+          - **CI/CD** — .github/workflows/
+          - **基础设施** — aws/(CloudFormation)
           PROMPT_EOF
           SYSTEM=$(sed 's/^          //' /tmp/system-prompt.txt)
 
