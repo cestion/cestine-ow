@@ -519,6 +519,7 @@ jobs:
 
   # ===========================================================================
   # PR 事件 Job 4: Impact Analysis
+  # (push 侧的同一套分析由上面的 branch-ai-review 承担,避免重复)
   # ===========================================================================
   pr-impact:
     name: Impact Analysis
@@ -732,11 +733,11 @@ jobs:
           path: ai-report.md
 
   # ===========================================================================
-  # PR 事件 Job 6: Bundle Size Diff
+  # Job 6: Bundle Size Diff(push 与 PR 都跑)
   # ===========================================================================
   pr-bundle-diff:
     name: Bundle Size Diff
-    if: github.event_name == 'pull_request' && vars.ENABLE_BUNDLE_DIFF != 'false'
+    if: vars.ENABLE_BUNDLE_DIFF != 'false'
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -765,9 +766,29 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pnpm-store-
 
+      - name: Resolve BASE / HEAD
+        id: refs
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "base=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            HEAD_SHA="${{ github.event.after }}"
+            BEFORE="${{ github.event.before }}"
+            if [[ "$BEFORE" =~ ^0+$ ]]; then
+              DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+              git fetch origin "$DEFAULT_BRANCH" --depth=100 || true
+              BASE_SHA=$(git merge-base "origin/$DEFAULT_BRANCH" "$HEAD_SHA" 2>/dev/null || echo "$HEAD_SHA~1")
+            else
+              BASE_SHA="$BEFORE"
+            fi
+            echo "base=$BASE_SHA" >> "$GITHUB_OUTPUT"
+            echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build BASE
         run: |
-          git checkout ${{ github.event.pull_request.base.sha }}
+          git checkout ${{ steps.refs.outputs.base }}
           pnpm install --frozen-lockfile
           pnpm run build:production
           du -sk .output > /tmp/base-size.txt
@@ -775,7 +796,7 @@ jobs:
 
       - name: Build HEAD
         run: |
-          git checkout ${{ github.event.pull_request.head.sha }}
+          git checkout ${{ steps.refs.outputs.head }}
           pnpm install --frozen-lockfile
           pnpm run build:production
           du -sk .output > /tmp/head-size.txt
@@ -792,8 +813,8 @@ jobs:
             echo ""
             echo "| Ref | Size |"
             echo "|-----|------|"
-            echo "| Base (\`${{ github.base_ref }}\`) | ${BASE_KB} KB |"
-            echo "| Head (\`${{ github.head_ref }}\`) | ${HEAD_KB} KB |"
+            echo "| Base | ${BASE_KB} KB |"
+            echo "| Head | ${HEAD_KB} KB |"
             echo "| **Δ** | **${DELTA_KB} KB** |"
             echo ""
             echo "<details><summary>Top 20 chunks (HEAD)</summary>"
@@ -804,17 +825,23 @@ jobs:
             echo "</details>"
           } > bundle-report.md
 
-      - uses: marocchino/sticky-pull-request-comment@v2
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
         with:
           header: pr-bundle
           path: bundle-report.md
 
+      - name: Publish to job summary
+        if: github.event_name == 'push'
+        run: cat bundle-report.md >> "$GITHUB_STEP_SUMMARY"
+
   # ===========================================================================
-  # PR 事件 Job 7: TypeScript Error Diff
+  # Job 7: TypeScript Error Diff(push 与 PR 都跑)
   # ===========================================================================
   pr-tsc-diff:
     name: TypeScript Error Diff
-    if: github.event_name == 'pull_request' && vars.ENABLE_TSC_DIFF != 'false'
+    if: vars.ENABLE_TSC_DIFF != 'false'
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -843,6 +870,26 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pnpm-store-
 
+      - name: Resolve BASE / HEAD
+        id: refs
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "base=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            HEAD_SHA="${{ github.event.after }}"
+            BEFORE="${{ github.event.before }}"
+            if [[ "$BEFORE" =~ ^0+$ ]]; then
+              DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+              git fetch origin "$DEFAULT_BRANCH" --depth=100 || true
+              BASE_SHA=$(git merge-base "origin/$DEFAULT_BRANCH" "$HEAD_SHA" 2>/dev/null || echo "$HEAD_SHA~1")
+            else
+              BASE_SHA="$BEFORE"
+            fi
+            echo "base=$BASE_SHA" >> "$GITHUB_OUTPUT"
+            echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          fi
+
       - run: pnpm install --frozen-lockfile
 
       - name: tsc on HEAD
@@ -853,7 +900,7 @@ jobs:
 
       - name: tsc on BASE
         run: |
-          git checkout ${{ github.event.pull_request.base.sha }} -- .
+          git checkout ${{ steps.refs.outputs.base }} -- .
           pnpm install --frozen-lockfile
           pnpm exec tsc --noEmit --pretty false 2>&1 \
             | grep -vE "src/api/__generated__/|src/solana/" \
@@ -882,7 +929,13 @@ jobs:
             fi
           } > tsc-report.md
 
-      - uses: marocchino/sticky-pull-request-comment@v2
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
         with:
           header: pr-tsc
           path: tsc-report.md
+
+      - name: Publish to job summary
+        if: github.event_name == 'push'
+        run: cat tsc-report.md >> "$GITHUB_STEP_SUMMARY"
