@@ -1,6 +1,7 @@
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { buildMindMapSvg, type MindMapNode, toLeafNodes } from './lib/mindmap-svg';
+import { DashboardPreviewSectionHeader } from '@/features/dashboard/components/DashboardPreviewSectionHeader';
 
 interface AnchorIdl {
   instructions: { name: string }[];
@@ -124,3 +125,9 @@ const svg = buildMindMapSvg(buildContractMindMap(), 'Contract Mind Map');
 mkdirSync(dirname(outputPath), { recursive: true });
 writeFileSync(outputPath, svg, 'utf8');
 console.log('SVG generated at docs/contract-mindmap.svg');
+
+
+
+DashboardPreviewSectionHeader
+
+DashboardPreviewSectionHeader
