@@ -203,10 +203,3 @@ console.log('SVG generated at docs/api-mindmap.svg');
 
 
 
-
-dsadsadsadsa
-
-
-dsadsadsadsads
-
-dsadsad
