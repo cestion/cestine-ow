@@ -27,6 +27,16 @@ on:
         required: false
         type: boolean
         default: true
+      run_business_analysis:
+        description: '从业务角度分析全量代码(约 26 次 LLM 调用,贵,默认关)'
+        required: false
+        type: boolean
+        default: false
+      business_domains:
+        description: '只分析指定业务域,逗号分隔(如 play,income,mining)。留空 = 全部 24 个域'
+        required: false
+        type: string
+        default: ''
 
 # =============================================================================
 # Config Variables (Settings → Variables)
@@ -40,6 +50,11 @@ on:
 #   PUSH_REVIEW_MODEL       : push 评审模型                (default: "MiniMax-M3")
 #   ENABLE_WHITEBOX_TEST    : "false" → 关闭白盒单测       (default: true)
 #   WHITEBOX_FAIL_ON_ERROR  : "true"  → 测试失败即阻断 CI  (default: false,仅报告)
+#
+# 业务全景分析相关(只在 workflow_dispatch + run_business_analysis=true 时才跑):
+#   ENABLE_BUSINESS_ANALYSIS : "false" → 关闭全量业务分析   (default: true)
+#   BUSINESS_ANALYSIS_MODEL  : 业务分析模型                 (default: "MiniMax-M3")
+#   BUSINESS_CONCURRENCY     : 逐域分析并发数               (default: 3)
 #
 # PR Analysis 相关:
 #   ENABLE_SONAR       : "true"  → 运行 SonarQube         (default: false)
@@ -1027,6 +1042,218 @@ jobs:
           curl -s -X POST "$FEISHU_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD"
+
+  # ===========================================================================
+  # 手动触发专属 Job: 全量代码业务分析 (AI)
+  #
+  # 与 push-code-review 是两种视角,并存而非替代:
+  #   push-code-review  读 git diff  → 「这次改动写得好不好」  → 每次 push 都跑
+  #   business-analysis 扫全量代码   → 「这产品在做什么生意、  → 只手动触发
+  #                                     业务规则是什么、
+  #                                     哪里有业务风险」
+  #
+  # 为什么必须手动:全量分析约 26 次 LLM 调用、45 万输入 token,挂到每次 push 上
+  # 是不可接受的开销;而 diff 评审单次只有几 K,适合常驻。
+  #
+  # LLM 编排放在 scripts/business-analysis.ts 里而不是写进这里的 `run: |` ——
+  # 这条链有 3 段调用 + 并发控制,块标量里既难维护,又踩过「续行顶到第 1 列导致
+  # 整个 workflow 解析失败」的坑(见 report-feishu 里那段注释)。
+  # ===========================================================================
+  business-analysis:
+    name: Business Analysis (AI, full codebase)
+    # 只为拿到白盒测试现状当上下文;它被开关关掉时是 skipped,本 job 不该跟着跳
+    needs: whitebox-test
+    if: >-
+      ${{ !cancelled()
+          && github.event_name == 'workflow_dispatch'
+          && inputs.run_business_analysis
+          && vars.ENABLE_BUSINESS_ANALYSIS != 'false' }}
+    runs-on: ubuntu-latest
+    # 26 次串/并行 LLM 调用,比其他 job 都慢
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 全量分析只看工作区当前状态,不需要历史
+          fetch-depth: 1
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Get pnpm store directory
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      # 测试现状作为 Stage 1 的上下文。whitebox-test 被关掉时没有这个 artifact,
+      # 脚本会自己走「本次未取到白盒单测结果」分支,所以失败不阻断。
+      - name: Download white-box test context
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: whitebox-ai-context-${{ github.run_id }}
+          path: /tmp/whitebox
+
+      - name: Run business analysis
+        id: analyze
+        env:
+          MINIMAX_KEY_BLOB: ${{ secrets.MINIMAX_KEY_BLOB }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          REVIEW_MODEL: ${{ vars.BUSINESS_ANALYSIS_MODEL || vars.PUSH_REVIEW_MODEL || 'MiniMax-M3' }}
+          MINIMAX_BASE_URL: ${{ vars.MINIMAX_BASE_URL || 'https://api.minimaxi.com/anthropic' }}
+          DOMAINS: ${{ inputs.business_domains }}
+          CONCURRENCY: ${{ vars.BUSINESS_CONCURRENCY || '3' }}
+        run: |
+          # 部分域失败时脚本用非零退出码,但报告已经写出来了 ——
+          # 先把产物拿到手,再由末尾的 policy 步骤决定要不要把 job 判红。
+          set +e
+          pnpm exec tsx scripts/business-analysis.ts \
+            --out=business-analysis \
+            --domains="$DOMAINS" \
+            --concurrency="$CONCURRENCY" \
+            --tests=/tmp/whitebox/ai-context.md
+          EXIT_CODE=$?
+          set -e
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+          echo "business-analysis exited with $EXIT_CODE"
+          exit 0
+
+      - name: Publish to job summary
+        if: always()
+        run: |
+          if [ -f business-analysis/report.md ]; then
+            cat business-analysis/report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## 📊 业务全景分析" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "_分析脚本未产出报告,请查看 Actions 日志。_" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload business analysis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: business-analysis-${{ github.run_id }}
+          path: business-analysis/
+          if-no-files-found: warn
+          retention-days: 30
+
+      # 自己发一张独立的卡,不去改 report-feishu。
+      # 那张卡的语义是「代码评审 + 白盒测试」,塞进第三块内容会冲淡它;而且它的
+      # needs 一旦加上本 job,push 事件的卡也要跟着改判空逻辑。
+      - name: Send Feishu card
+        if: ${{ always() && inputs.notify_feishu }}
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EXIT_CODE: ${{ steps.analyze.outputs.exit_code }}
+        run: |
+          if [ -z "$FEISHU_WEBHOOK_URL" ]; then
+            echo "FEISHU_WEBHOOK_URL not set; skipping notification"
+            exit 0
+          fi
+
+          S=business-analysis/summary.json
+          if [ -f "$S" ]; then
+            MODEL=$(jq -r '.model' "$S")
+            ROUTES=$(jq -r '.routes' "$S")
+            OPS=$(jq -r '.operations' "$S")
+            OK=$(jq -r '.domainsAnalyzed' "$S")
+            TOTAL=$(jq -r '.domainsTotal' "$S")
+            CALLS=$(jq -r '.llmCalls' "$S")
+            STATS="模型 \`${MODEL}\` · 路由 **${ROUTES}** · 接口 **${OPS}** · 业务域 **${OK}/${TOTAL}** · LLM 调用 **${CALLS}** 次"
+          else
+            MODEL="-"
+            STATS="_未产出 summary.json,分析可能未执行成功。_"
+          fi
+
+          # 主色:全部成功=紫;有域失败但出了报告=橙;压根没产出=红
+          if [ ! -f business-analysis/report.md ]; then
+            TEMPLATE="red";    TITLE="❌ 业务全景分析(未产出)"
+          elif [ "${EXIT_CODE:-1}" != "0" ]; then
+            TEMPLATE="orange"; TITLE="🟠 业务全景分析(部分域失败)"
+          else
+            TEMPLATE="purple"; TITLE="📊 业务全景分析"
+          fi
+
+          # 卡片只放跨域收口结论(synthesis),各域详情去 artifact 看。
+          # 一律用 printf 拼多行,不写字面换行的赋值 —— 见 report-feishu 的注释。
+          if [ -f business-analysis/synthesis.md ]; then
+            BODY=$(head -c 2500 business-analysis/synthesis.md)
+            if [ "$(wc -c < business-analysis/synthesis.md)" -gt 2500 ]; then
+              BODY=$(printf '%s\n\n%s' "$BODY" '_…内容过长已截断,完整版见 Actions job summary 与 artifact。_')
+            fi
+          else
+            BODY="_分析未产出结论,请查看 Actions 日志。_"
+          fi
+
+          PAYLOAD=$(jq -n \
+            --arg repo   "$REPO" \
+            --arg branch "$BRANCH" \
+            --arg actor  "$ACTOR" \
+            --arg stats  "$STATS" \
+            --arg body   "$BODY" \
+            --arg run    "$RUN_URL" \
+            --arg tmpl   "$TEMPLATE" \
+            --arg title  "$TITLE" \
+            '{
+              msg_type: "interactive",
+              card: {
+                config: { wide_screen_mode: true, enable_forward: true },
+                header: {
+                  template: $tmpl,
+                  title: { tag: "plain_text", content: $title }
+                },
+                elements: [
+                  {
+                    tag: "div",
+                    fields: [
+                      { is_short: true, text: { tag: "lark_md", content: ("**🌿 分支**\n`" + $branch + "`") } },
+                      { is_short: true, text: { tag: "lark_md", content: ("**👤 触发人**\n" + $actor) } }
+                    ]
+                  },
+                  { tag: "div", text: { tag: "lark_md", content: $stats } },
+                  { tag: "hr" },
+                  { tag: "div", text: { tag: "lark_md", content: $body } },
+                  { tag: "hr" },
+                  { tag: "note", elements: [ { tag: "plain_text", content: ("📦 " + $repo + " · 各业务域详细分析见 Actions artifact") } ] },
+                  {
+                    tag: "action",
+                    actions: [
+                      { tag: "button", text: { tag: "plain_text", content: "⚙️ 查看完整报告" }, type: "primary", url: $run }
+                    ]
+                  }
+                ]
+              }
+            }')
+
+          curl -s -X POST "$FEISHU_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD"
+
+      - name: Enforce failure policy
+        # 报告已经产出并上传,这里只负责把 job 状态标对
+        if: ${{ always() && steps.analyze.outputs.exit_code != '0' }}
+        run: |
+          echo "::error::业务分析未完全成功 (exit=${{ steps.analyze.outputs.exit_code }}),详见日志与 artifact"
+          exit 1
 
   # ===========================================================================
   # PR 事件 Job 1: Lark 通知

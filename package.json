@@ -42,6 +42,8 @@
     "test:coverage": "vitest run --coverage",
     "whitebox": "bash -c 'vitest run --coverage --passWithNoTests --reporter=default --reporter=json --outputFile=/tmp/vitest-results.json; code=$?; VITEST_EXIT_CODE=$code tsx scripts/whitebox-report.ts; exit $code'",
     "whitebox:report": "tsx scripts/whitebox-report.ts",
+    "business:map": "tsx scripts/business-map.ts",
+    "business:analyze": "tsx scripts/business-analysis.ts",
     "typecheck": "bash -c 'tsc --noEmit --pretty false 2>&1 | tee /tmp/onestory-tsc.log | grep -vE \"src/api/__generated__/|src/solana/\" | grep \"error TS\" >&2; ! grep -vE \"src/api/__generated__/|src/solana/\" /tmp/onestory-tsc.log | grep -q \"error TS\"'",
     "generate:solana": "codama run js && tsx scripts/patch-solana-generated.ts"
   },

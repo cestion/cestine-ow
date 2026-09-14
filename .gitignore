@@ -57,3 +57,7 @@ demo
 
 # Vitest 覆盖率产物（CI 走 artifact，不入库）
 coverage/
+
+# 业务全景分析产物（CI 走 artifact，不入库）
+# 前导 / 是必须的：不加就会连 .agents/skills/business-analysis/ 一起忽略掉
+/business-analysis/
