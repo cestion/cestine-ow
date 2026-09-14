@@ -1108,6 +1108,20 @@ jobs:
           name: whitebox-ai-context-${{ github.run_id }}
           path: /tmp/whitebox
 
+      # 单独一步做密钥自检:26 次调用跑到一半才发现 key 不对太亏,
+      # 而且失败时这一步会独立标红,一眼看出问题在配置不在分析逻辑。
+      # 脚本只报「能不能用」与失败原因,不打印 key 内容、也不回显 blob。
+      - name: Check LLM key
+        env:
+          MINIMAX_KEY_BLOB: ${{ secrets.MINIMAX_KEY_BLOB }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          REVIEW_MODEL: ${{ vars.BUSINESS_ANALYSIS_MODEL || vars.PUSH_REVIEW_MODEL || 'MiniMax-M3' }}
+          MINIMAX_BASE_URL: ${{ vars.MINIMAX_BASE_URL || 'https://api.minimaxi.com/anthropic' }}
+          # 只有当初 encode 时用了自定义盐值才需要;secret 不存在时为空,
+          # keyring.sh 的 ${KR_S:-cestine} 会自动回到默认值
+          KR_S: ${{ secrets.KR_S }}
+        run: pnpm exec tsx scripts/lib/llm.ts
+
       - name: Run business analysis
         id: analyze
         env:
@@ -1115,6 +1129,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           REVIEW_MODEL: ${{ vars.BUSINESS_ANALYSIS_MODEL || vars.PUSH_REVIEW_MODEL || 'MiniMax-M3' }}
           MINIMAX_BASE_URL: ${{ vars.MINIMAX_BASE_URL || 'https://api.minimaxi.com/anthropic' }}
+          KR_S: ${{ secrets.KR_S }}
           DOMAINS: ${{ inputs.business_domains }}
           CONCURRENCY: ${{ vars.BUSINESS_CONCURRENCY || '3' }}
         run: |
