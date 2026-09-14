@@ -54,3 +54,6 @@ mcp.json
 
 demo
 .codegraph
+
+# Vitest 覆盖率产物（CI 走 artifact，不入库）
+coverage/

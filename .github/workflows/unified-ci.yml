@@ -8,6 +8,25 @@ on:
     branches: ["**"]
   pull_request:
     types: [opened, synchronize, reopened]
+  # 手动触发: Actions → Unified CI Pipeline → Run workflow
+  # 只跑「白盒测试 → AI 评审 → 汇总」这条链,不跑 bundle/tsc 那些重活。
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: '对比基线 (branch / tag / SHA)。留空则用与默认分支的 merge-base'
+        required: false
+        type: string
+        default: ''
+      run_ai_review:
+        description: '测试跑完后调用 LLM 做代码评审(会消耗 token)'
+        required: false
+        type: boolean
+        default: true
+      notify_feishu:
+        description: '把汇总结果推送到飞书'
+        required: false
+        type: boolean
+        default: true
 
 # =============================================================================
 # Config Variables (Settings → Variables)
@@ -15,6 +34,12 @@ on:
 #   ENABLE_BRANCH_AI   : "false" → 跳过分支 AI 分析        (default: enabled)
 #   MINIMAX_MODEL      : MiniMax 模型 ID                  (default: "MiniMax-M3")
 #   MINIMAX_BASE_URL   : MiniMax API base                 (default: "https://api.minimaxi.com/anthropic")
+#
+# Push 评审 / 白盒测试相关:
+#   ENABLE_PUSH_CODE_REVIEW : "false" → 关闭 push 代码评审 (default: true)
+#   PUSH_REVIEW_MODEL       : push 评审模型                (default: "MiniMax-M3")
+#   ENABLE_WHITEBOX_TEST    : "false" → 关闭白盒单测       (default: true)
+#   WHITEBOX_FAIL_ON_ERROR  : "true"  → 测试失败即阻断 CI  (default: false,仅报告)
 #
 # PR Analysis 相关:
 #   ENABLE_SONAR       : "true"  → 运行 SonarQube         (default: false)
@@ -36,7 +61,14 @@ on:
 concurrency:
   # Push 事件: 按 ref 分组 (branch-ai-review + feishu-webhook 共享)
   # PR 事件: 按 PR 号分组 (pr-analysis 的所有 job)
-  group: ${{ github.event_name == 'pull_request' && format('pr-analysis-{0}', github.event.pull_request.number) || format('push-notify-{0}', github.ref) }}
+  # 手动触发: 单独分组并按 run_id 唯一 —— 手动跑是有意为之的动作,
+  #          既不该被后续 push 取消,也不该去取消正在跑的 push 流水线。
+  group: >-
+    ${{
+      github.event_name == 'pull_request' && format('pr-analysis-{0}', github.event.pull_request.number)
+      || github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id)
+      || format('push-notify-{0}', github.ref)
+    }}
   cancel-in-progress: true
 
 jobs:
@@ -429,11 +461,25 @@ jobs:
 
   # ===========================================================================
   # Push 事件 Job 3: 代码级 AI 评审(仿 PR-Agent,但输出到飞书/job summary)
+  #
+  # 依赖 whitebox-test:评审必须拿到真实测试结果才动笔。模型看 diff 只能猜
+  # 「这里可能有 bug」,拿到「这个函数 0 覆盖率且它的用例挂了」才是硬证据。
+  # refs 由 whitebox-test 统一解析后透传,这里不再重复一遍。
   # ===========================================================================
   push-code-review:
     name: Push Code Review (AI)
-    if: github.event_name == 'push' && vars.ENABLE_PUSH_CODE_REVIEW != 'false'
+    needs: whitebox-test
+    # whitebox-test 被开关关掉时是 skipped,评审不该跟着一起被跳过
+    if: >-
+      ${{ !cancelled()
+          && (github.event_name == 'push'
+              || (github.event_name == 'workflow_dispatch' && inputs.run_ai_review))
+          && vars.ENABLE_PUSH_CODE_REVIEW != 'false' }}
     runs-on: ubuntu-latest
+    # 评审结论交给下游 report-feishu 统一发卡,本 job 自己不再单独推飞书
+    outputs:
+      review: ${{ steps.review.outputs.review }}
+      changed: ${{ steps.count.outputs.count }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -441,18 +487,39 @@ jobs:
 
       - name: Resolve BASE / HEAD
         id: refs
+        env:
+          # whitebox-test 已经算过一次;它被跳过时(job 关闭)才走本地兜底
+          UPSTREAM_BASE: ${{ needs.whitebox-test.outputs.base }}
+          UPSTREAM_HEAD: ${{ needs.whitebox-test.outputs.head }}
         run: |
-          HEAD_SHA="${{ github.event.after }}"
-          BEFORE="${{ github.event.before }}"
-          if [[ "$BEFORE" =~ ^0+$ ]]; then
-            DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
-            git fetch origin "$DEFAULT_BRANCH" --depth=100 || true
-            BASE_SHA=$(git merge-base "origin/$DEFAULT_BRANCH" "$HEAD_SHA" 2>/dev/null || echo "$HEAD_SHA~1")
-          else
-            BASE_SHA="$BEFORE"
+          BASE_SHA="$UPSTREAM_BASE"
+          HEAD_SHA="$UPSTREAM_HEAD"
+
+          if [ -z "$HEAD_SHA" ]; then
+            HEAD_SHA="${{ github.event.after || github.sha }}"
           fi
+          if [ -z "$BASE_SHA" ]; then
+            BEFORE="${{ github.event.before }}"
+            if [ -n "$BEFORE" ] && ! [[ "$BEFORE" =~ ^0+$ ]]; then
+              BASE_SHA="$BEFORE"
+            else
+              DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+              BASE_SHA=$(git merge-base "origin/$DEFAULT_BRANCH" "$HEAD_SHA" 2>/dev/null || echo "$HEAD_SHA~1")
+            fi
+          fi
+
           echo "base=$BASE_SHA" >> "$GITHUB_OUTPUT"
           echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "Reviewing $BASE_SHA..$HEAD_SHA"
+
+      # whitebox-test 跑在另一个 runner 上,它的 /tmp 不共享,靠 artifact 传递
+      - name: Download white-box test context
+        if: ${{ needs.whitebox-test.result != 'skipped' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: whitebox-ai-context-${{ github.run_id }}
+          path: /tmp/whitebox
 
       - name: Count changed source files
         id: count
@@ -495,11 +562,37 @@ jobs:
           MINIMAX_BASE: ${{ vars.MINIMAX_BASE_URL || 'https://api.minimaxi.com/anthropic' }}
           COMMIT_MSG: ${{ github.event.head_commit.message }}
           BRANCH: ${{ github.ref_name }}
+          TEST_STATUS: ${{ needs.whitebox-test.result }}
         run: |
           DIFF=$(cat /tmp/review-diff.patch)
 
+          # workflow_dispatch 没有 head_commit,回落到 git log
+          if [ -z "$COMMIT_MSG" ]; then
+            COMMIT_MSG=$(git log -1 --pretty=%s "${{ steps.refs.outputs.head }}" 2>/dev/null || echo "(手动触发)")
+          fi
+
+          # 白盒测试上下文。拿不到就明说「没跑」,不要让模型误以为测试全绿。
+          if [ -s /tmp/whitebox/ai-context.md ]; then
+            TESTS=$(cat /tmp/whitebox/ai-context.md)
+          elif [ "$TEST_STATUS" = "skipped" ]; then
+            TESTS="本次未运行白盒单测(ENABLE_WHITEBOX_TEST 已关闭)。评审时不要假设代码有测试保护。"
+          else
+            TESTS="白盒单测运行了但结果未能取回(job 结论:${TEST_STATUS:-unknown})。评审时不要假设代码有测试保护。"
+          fi
+
           cat > /tmp/system-prompt.txt <<'PROMPT_EOF'
-          你是代码评审专家,对一次 push 做代码质量评审。输出精简的中文 Markdown,包含:
+          你是代码评审专家,对一次 push 做代码质量评审。
+
+          你会同时拿到 diff 和这次改动的**白盒单测实测结果**。测试结果是事实证据,
+          比你从 diff 里推断出的猜测更可信,评审时必须用上:
+
+          - 有失败用例 → 把它当最高优先级线索,顺着失败信息在 diff 里定位成因,
+            而不是泛泛复述"测试挂了"。
+          - 本次改动的文件被标为「零覆盖」→ 对这些文件的评审要更严格,
+            因为它们的行为改动没有任何自动化验证兜底;在建议里点名该补什么用例。
+          - 测试全绿也不等于没问题:覆盖率只覆盖逻辑层,UI 与副作用不在范围内。
+
+          输出精简的中文 Markdown,包含:
 
           **🔍 关键发现** — 按严重度排序,最多 5 条:
           - 逻辑错误、潜在崩溃、资源泄漏
@@ -507,19 +600,23 @@ jobs:
           - 性能问题(不必要的重渲染、同步阻塞、内存占用)
           - 类型不安全、边界条件未处理
 
+          **🧪 测试视角** — 结合上面的实测结果,最多 3 条:失败用例的根因推断,
+          或本次改动中最该补测试的位置(点名文件与函数)。没什么可说就写一行"无"。
+
           **✅ 做得好的地方** — 最多 3 条值得称赞的实践。
 
           **💡 建议** — 可选优化,非阻断性,最多 3 条。
 
-          要求:引用具体文件与行号,用反引号包文件名;若代码质量良好无重大问题,直言 "未发现严重问题";控制在 600 字内。
+          要求:引用具体文件与行号,用反引号包文件名;若代码质量良好无重大问题,直言 "未发现严重问题";控制在 700 字内。
           PROMPT_EOF
           SYSTEM=$(sed 's/^          //' /tmp/system-prompt.txt)
 
           USER=$(jq -n \
             --arg branch "$BRANCH" \
             --arg msg "$COMMIT_MSG" \
+            --arg tests "$TESTS" \
             --arg diff "$DIFF" \
-            '"# 分支\n\($branch)\n\n# 提交信息\n\($msg)\n\n# Diff\n```diff\n\($diff)\n```"')
+            '"# 分支\n\($branch)\n\n# 提交信息\n\($msg)\n\n# 白盒测试结果(实测,非推断)\n\($tests)\n\n# Diff\n```diff\n\($diff)\n```"')
 
           # 根据配置选择 API
           if [[ "$REVIEW_MODEL" == MiniMax* ]] && [ -n "$MINIMAX_KEY_BLOB" ]; then
@@ -588,37 +685,317 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Notify Feishu (optional)
-        if: steps.count.outputs.count != '0'
+  # ===========================================================================
+  # Push 事件 Job 2.5: 白盒单测(Vitest)—— 整条评审链的上游
+  #
+  # 与上游三个 AI job 的本质区别:这一步**真的执行代码**,不是让模型读 diff 说话。
+  # 因此它必须跑在 push-code-review 之前 —— 评审模型拿到「这个函数的用例挂了 /
+  # 这次改的文件零覆盖」才算有据可依,只看 diff 就只能靠猜。
+  #
+  # 覆盖范围见 vitest.config.ts 的 coverage.include(逻辑层:utils/lib/stores/hooks/api)。
+  # 结果的解析、渲染、喂给 LLM 的裁剪,全部收敛在 scripts/whitebox-report.ts,
+  # 本地 skill 与 CI 共用同一份逻辑,不在 YAML 里再写一遍 jq。
+  # ===========================================================================
+  whitebox-test:
+    name: White-box Tests (Vitest)
+    if: >-
+      ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+          && vars.ENABLE_WHITEBOX_TEST != 'false' }}
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.parse.outputs.status }}
+      total: ${{ steps.parse.outputs.total }}
+      passed: ${{ steps.parse.outputs.passed }}
+      failed: ${{ steps.parse.outputs.failed }}
+      skipped: ${{ steps.parse.outputs.skipped }}
+      files: ${{ steps.parse.outputs.files }}
+      coverage: ${{ steps.parse.outputs.coverage }}
+      passRate: ${{ steps.parse.outputs.passRate }}
+      failures: ${{ steps.parse.outputs.failures }}
+      # 下游 push-code-review 直接复用,避免两个 job 各算一遍 merge-base
+      base: ${{ steps.refs.outputs.base }}
+      head: ${{ steps.refs.outputs.head }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 需要历史来算 merge-base 和 changed-file 覆盖率
+          fetch-depth: 0
+
+      - name: Resolve BASE / HEAD
+        id: refs
+        env:
+          # workflow_dispatch 没有 event.before/after,只有 github.sha
+          MANUAL_BASE: ${{ inputs.base_ref }}
+        run: |
+          HEAD_SHA="${{ github.event.after || github.sha }}"
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+
+          # checkout 用了 fetch-depth: 0,所有 branch/tag 的完整历史都已在本地。
+          # 这里**不要**再 `git fetch --depth=N` —— 那会把完整仓库改成浅仓库,
+          # 反而让后面的 merge-base 算不出来。
+
+          if [ -n "$MANUAL_BASE" ]; then
+            # 手动触发且显式指定了基线
+            BASE_SHA=$(git rev-parse --verify "$MANUAL_BASE^{commit}" 2>/dev/null \
+              || git rev-parse --verify "origin/$MANUAL_BASE^{commit}" 2>/dev/null \
+              || echo "")
+            if [ -z "$BASE_SHA" ]; then
+              echo "::warning::基线 '$MANUAL_BASE' 解析不出来,回退到与默认分支的 merge-base"
+            fi
+          fi
+
+          if [ -z "${BASE_SHA:-}" ]; then
+            BEFORE="${{ github.event.before }}"
+            if [ -n "$BEFORE" ] && ! [[ "$BEFORE" =~ ^0+$ ]]; then
+              BASE_SHA="$BEFORE"
+            else
+              BASE_SHA=$(git merge-base "origin/$DEFAULT_BRANCH" "$HEAD_SHA" 2>/dev/null || echo "$HEAD_SHA~1")
+            fi
+          fi
+
+          echo "base=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "Diff range: $BASE_SHA..$HEAD_SHA"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Get pnpm store directory
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Run white-box tests
+        id: vitest
+        run: |
+          # 不用 `pnpm test:coverage`:pnpm 会吃掉 --reporter 这类参数,直接调 vitest 更可控。
+          # --passWithNoTests:测试是分批生成进仓库的,空仓阶段不该把 CI 搞红。
+          set +e
+          pnpm exec vitest run \
+            --coverage \
+            --passWithNoTests \
+            --reporter=default \
+            --reporter=json \
+            --outputFile=/tmp/vitest-results.json
+          EXIT_CODE=$?
+          set -e
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+          echo "vitest exited with $EXIT_CODE"
+          exit 0
+
+      - name: Aggregate report
+        id: parse
+        env:
+          VITEST_EXIT_CODE: ${{ steps.vitest.outputs.exit_code }}
+          VITEST_RESULTS: /tmp/vitest-results.json
+          BASE_SHA: ${{ steps.refs.outputs.base }}
+          HEAD_SHA: ${{ steps.refs.outputs.head }}
+        run: |
+          mkdir -p /tmp/whitebox
+
+          # 三种形态一次性产出:json 喂 job outputs,markdown 进 summary,
+          # ai 是给下游评审模型的裁剪版(只留失败原因 + 本次改动的零覆盖文件)。
+          pnpm exec tsx scripts/whitebox-report.ts --format=json     > /tmp/whitebox/summary.json
+          pnpm exec tsx scripts/whitebox-report.ts --format=markdown > /tmp/whitebox/report.md
+          pnpm exec tsx scripts/whitebox-report.ts --format=ai       > /tmp/whitebox/ai-context.md
+
+          S=/tmp/whitebox/summary.json
+          {
+            echo "status=$(jq -r '.status' "$S")"
+            echo "total=$(jq -r '.total' "$S")"
+            echo "passed=$(jq -r '.passed' "$S")"
+            echo "failed=$(jq -r '.failed' "$S")"
+            echo "skipped=$(jq -r '.skipped' "$S")"
+            echo "files=$(jq -r '.files' "$S")"
+            echo "coverage=$(jq -r '.coverageLines // "-"' "$S")"
+            echo "passRate=$(jq -r '.passRate // "-"' "$S")"
+          } >> "$GITHUB_OUTPUT"
+
+          # 失败清单单独走 heredoc(多行),飞书卡片侧再截断
+          {
+            echo "failures<<EOF_FAILURES"
+            jq -r '
+              if (.failures | length) == 0 then "_无失败用例_"
+              else (.failures | map("- `\(.file | split("/") | last)` › \(.name)") | join("\n"))
+              end
+            ' "$S"
+            echo "EOF_FAILURES"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish to job summary
+        if: always()
+        run: |
+          if [ -f /tmp/whitebox/report.md ]; then
+            cat /tmp/whitebox/report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## 🧪 白盒单测 (Vitest)" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "_汇总脚本未执行成功,请查看 Actions 日志。_" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # push-code-review 在另一个 runner 上,拿不到这里的 /tmp。
+      # 走 artifact 传 ai-context.md,而不是塞进 job output ——
+      # job output 有 1MB 上限且会被 GitHub 做表达式插值,多行 Markdown 容易被玩坏。
+      - name: Upload AI review context
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: whitebox-ai-context-${{ github.run_id }}
+          path: /tmp/whitebox/ai-context.md
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: whitebox-coverage-${{ github.run_id }}
+          path: coverage/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Enforce failure policy
+        # 默认不阻断,与现有全部 job 的行为一致;要把 CI 变成真门禁就把这个变量打开
+        if: ${{ vars.WHITEBOX_FAIL_ON_ERROR == 'true' && steps.parse.outputs.status != 'passed' && steps.parse.outputs.status != 'empty' }}
+        run: |
+          echo "::error::白盒单测未通过 (status=${{ steps.parse.outputs.status }}),WHITEBOX_FAIL_ON_ERROR=true 故阻断"
+          exit 1
+
+  # ===========================================================================
+  # Push 事件 Job 4: 汇总 AI 评审 + 白盒测试结果 → 一张飞书卡片
+  #
+  # push-code-review 与 whitebox-test 都不再自己发卡,统一由这里发,
+  # 避免一次 push 收到三四张卡。手动触发时由 notify_feishu 输入决定发不发。
+  # ===========================================================================
+  report-feishu:
+    name: Report to Feishu
+    needs: [push-code-review, whitebox-test]
+    if: >-
+      ${{ always()
+          && (github.event_name == 'push'
+              || (github.event_name == 'workflow_dispatch' && inputs.notify_feishu)) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send merged report card
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
           REPO: ${{ github.repository }}
           BRANCH: ${{ github.ref_name }}
           ACTOR: ${{ github.actor }}
-          COMMIT_ID: ${{ github.event.head_commit.id }}
-          COMMIT_URL: ${{ github.event.head_commit.url }}
-          REVIEW: ${{ steps.review.outputs.review }}
+          EVENT: ${{ github.event_name }}
+          # workflow_dispatch 没有 head_commit,退回 github.sha 与 commit 页面 URL
+          COMMIT_ID: ${{ github.event.head_commit.id || github.sha }}
+          COMMIT_URL: ${{ github.event.head_commit.url || format('{0}/{1}/commit/{2}', github.server_url, github.repository, github.sha) }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REVIEW_RESULT: ${{ needs.push-code-review.result }}
+          REVIEW: ${{ needs.push-code-review.outputs.review }}
+          REVIEW_CHANGED: ${{ needs.push-code-review.outputs.changed }}
+          TEST_RESULT: ${{ needs.whitebox-test.result }}
+          TEST_STATUS: ${{ needs.whitebox-test.outputs.status }}
+          TEST_TOTAL: ${{ needs.whitebox-test.outputs.total }}
+          TEST_PASSED: ${{ needs.whitebox-test.outputs.passed }}
+          TEST_FAILED: ${{ needs.whitebox-test.outputs.failed }}
+          TEST_SKIPPED: ${{ needs.whitebox-test.outputs.skipped }}
+          TEST_FILES: ${{ needs.whitebox-test.outputs.files }}
+          TEST_COVERAGE: ${{ needs.whitebox-test.outputs.coverage }}
+          TEST_RATE: ${{ needs.whitebox-test.outputs.passRate }}
+          TEST_FAILURES: ${{ needs.whitebox-test.outputs.failures }}
         run: |
           if [ -z "$FEISHU_WEBHOOK_URL" ]; then
-            echo "FEISHU_WEBHOOK_URL not set; skipping Feishu notification"
+            echo "FEISHU_WEBHOOK_URL not set; skipping notification"
             exit 0
           fi
 
           SHORT_SHA="${COMMIT_ID:0:7}"
+          SUFFIX=""
+          [ "$EVENT" = "workflow_dispatch" ] && SUFFIX=" · 手动触发"
+
+          # ---- 卡片主色与标题由测试结果决定,测试是唯一会"判对错"的环节 ----
+          case "$TEST_STATUS" in
+            passed)
+              TEMPLATE="green"; TITLE="✅ 代码评审 + 白盒测试${SUFFIX}"
+              TEST_HEAD="✅ **全部通过**" ;;
+            failed)
+              TEMPLATE="red";   TITLE="❌ 代码评审 + 白盒测试${SUFFIX}"
+              TEST_HEAD="❌ **有用例失败**" ;;
+            empty)
+              TEMPLATE="grey";  TITLE="⚪️ 代码评审 + 白盒测试(无用例)${SUFFIX}"
+              TEST_HEAD="⚪️ **暂无测试用例** — 本地跑 \`pnpm whitebox\` 起步" ;;
+            error)
+              TEMPLATE="orange"; TITLE="🟠 代码评审 + 白盒测试(执行异常)${SUFFIX}"
+              TEST_HEAD="🟠 **Vitest 执行异常**" ;;
+            *)
+              TEMPLATE="grey";  TITLE="⚪️ 代码评审 + 白盒测试(未执行)${SUFFIX}"
+              TEST_HEAD="⚪️ **测试未执行**(job 结果:${TEST_RESULT:-skipped})" ;;
+          esac
+
+          # ---- 通过率(whitebox-report.ts 已经算好,这里只做展示兜底)----
+          if [ -n "$TEST_RATE" ] && [ "$TEST_RATE" != "-" ] && [ "$TEST_RATE" != "null" ]; then
+            RATE_TEXT="${TEST_RATE}% (${TEST_PASSED}/${TEST_TOTAL})"
+          else
+            RATE_TEXT="—"
+          fi
+
+          # ---- AI 评审正文 ----
+          if [ "$REVIEW_RESULT" != "success" ]; then
+            REVIEW_BODY="_AI 评审未执行(job 结果:${REVIEW_RESULT:-skipped})。_"
+          elif [ "${REVIEW_CHANGED:-0}" = "0" ]; then
+            REVIEW_BODY="_本次推送未修改源码,已跳过代码评审。_"
+          elif [ -z "$REVIEW" ]; then
+            REVIEW_BODY="_评审未生成结果,请查看 Actions 日志。_"
+          else
+            # 飞书单个 div 有长度上限,超长截断。
+            # 注意:这里一律用 printf 拼多行,不写字面换行的赋值 —— YAML 的 `run: |`
+            # 是块标量,一旦续行顶到第 1 列就会提前终止块,整个 workflow 文件解析失败。
+            REVIEW_BODY=$(printf '%s' "$REVIEW" | head -c 2500)
+            if [ "$(printf '%s' "$REVIEW" | wc -c)" -gt 2500 ]; then
+              REVIEW_BODY=$(printf '%s\n\n%s' "$REVIEW_BODY" '_…评审内容过长已截断,完整版见 Actions job summary。_')
+            fi
+          fi
+
+          # ---- 测试正文 ----
+          TEST_BODY="$TEST_HEAD"
+          if [ "${TEST_TOTAL:-0}" -gt 0 ] 2>/dev/null; then
+            STATS="测试文件 **${TEST_FILES}** · 用例 **${TEST_TOTAL}** · 通过 **${TEST_PASSED}** · 失败 **${TEST_FAILED}** · 跳过 **${TEST_SKIPPED}** · 行覆盖率 **${TEST_COVERAGE}%**"
+            TEST_BODY=$(printf '%s\n\n%s' "$TEST_BODY" "$STATS")
+          fi
+          if [ "$TEST_STATUS" = "failed" ] || [ "$TEST_STATUS" = "error" ]; then
+            TEST_BODY=$(printf '%s\n\n**失败用例**\n%s' "$TEST_BODY" "$TEST_FAILURES")
+          fi
+
           PAYLOAD=$(jq -n \
-            --arg repo "$REPO" \
+            --arg repo   "$REPO" \
             --arg branch "$BRANCH" \
-            --arg actor "$ACTOR" \
-            --arg sha "$SHORT_SHA" \
-            --arg review "${REVIEW:-_评审未生成_}" \
+            --arg actor  "$ACTOR" \
+            --arg sha    "$SHORT_SHA" \
+            --arg rate   "$RATE_TEXT" \
+            --arg review "$REVIEW_BODY" \
+            --arg test   "$TEST_BODY" \
             --arg commit "$COMMIT_URL" \
+            --arg run    "$RUN_URL" \
+            --arg tmpl   "$TEMPLATE" \
+            --arg title  "$TITLE" \
             '{
               msg_type: "interactive",
               card: {
                 config: { wide_screen_mode: true, enable_forward: true },
                 header: {
-                  template: "blue",
-                  title: { tag: "plain_text", content: "🔍 代码评审 (AI)" }
+                  template: $tmpl,
+                  title: { tag: "plain_text", content: $title }
                 },
                 elements: [
                   {
@@ -626,17 +1003,21 @@ jobs:
                     fields: [
                       { is_short: true, text: { tag: "lark_md", content: ("**🌿 分支**\n`" + $branch + "`") } },
                       { is_short: true, text: { tag: "lark_md", content: ("**🔖 版本**\n`" + $sha + "`") } },
-                      { is_short: true, text: { tag: "lark_md", content: ("**👤 提交人**\n" + $actor) } }
+                      { is_short: true, text: { tag: "lark_md", content: ("**👤 提交人**\n" + $actor) } },
+                      { is_short: true, text: { tag: "lark_md", content: ("**📈 通过率**\n" + $rate) } }
                     ]
                   },
                   { tag: "hr" },
-                  { tag: "div", text: { tag: "lark_md", content: $review } },
+                  { tag: "div", text: { tag: "lark_md", content: ("**🔍 代码评审 (AI)**\n" + $review) } },
+                  { tag: "hr" },
+                  { tag: "div", text: { tag: "lark_md", content: ("**🧪 白盒单测 (Vitest)**\n" + $test) } },
                   { tag: "hr" },
                   { tag: "note", elements: [ { tag: "plain_text", content: ("📦 " + $repo) } ] },
                   {
                     tag: "action",
                     actions: [
-                      { tag: "button", text: { tag: "plain_text", content: "🔍 查看提交" }, type: "primary", url: $commit }
+                      { tag: "button", text: { tag: "plain_text", content: "🔍 查看提交" },  type: "primary", url: $commit },
+                      { tag: "button", text: { tag: "plain_text", content: "⚙️ 查看 Actions" }, type: "default", url: $run }
                     ]
                   }
                 ]

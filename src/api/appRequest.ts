@@ -6,7 +6,6 @@ import { resolveBusinessErrorMessage } from '@/api/resolveBusinessErrorMessage';
 import i18n from '@/i18n';
 import useGlobalStore from '@/stores/global';
 import { parseJsonPreservingSnowflakeIds } from '@/utils/parseSnowflakeJson';
-import { DashboardMobileHeader } from '@/features/dashboard/components/DashboardMobileHeader';
 
 export interface BaseResponse<T> {
   code: number;
@@ -164,12 +163,3 @@ export async function appAxiosInstance<T>(
 export async function appRequest<T>(options: AxiosRequestConfig): Promise<T> {
   return axiosClient(options).then((res: AxiosResponse<T>) => res.data);
 }
-
-dsaghdskjhska
-
-dsadsadsadsads
-
-
-dsadsadsadsads
-DashboardMobileHeader
-dsadsadsadsa

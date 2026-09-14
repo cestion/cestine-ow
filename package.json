@@ -37,6 +37,11 @@
     "assets:optimize": "tsx scripts/optimize-images.ts",
     "assets:optimize:videos": "tsx scripts/optimize-videos.ts",
     "prepare": "husky",
+    "test:unit": "vitest",
+    "test:unit:run": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "whitebox": "bash -c 'vitest run --coverage --passWithNoTests --reporter=default --reporter=json --outputFile=/tmp/vitest-results.json; code=$?; VITEST_EXIT_CODE=$code tsx scripts/whitebox-report.ts; exit $code'",
+    "whitebox:report": "tsx scripts/whitebox-report.ts",
     "typecheck": "bash -c 'tsc --noEmit --pretty false 2>&1 | tee /tmp/onestory-tsc.log | grep -vE \"src/api/__generated__/|src/solana/\" | grep \"error TS\" >&2; ! grep -vE \"src/api/__generated__/|src/solana/\" /tmp/onestory-tsc.log | grep -q \"error TS\"'",
     "generate:solana": "codama run js && tsx scripts/patch-solana-generated.ts"
   },
@@ -132,6 +137,8 @@
     "@sentry/vite-plugin": "^5.4.0",
     "@tailwindcss/vite": "^4.2.2",
     "@tanstack/router-cli": "1.166.25",
+    "@testing-library/dom": "^10.4.1",
+    "@testing-library/react": "^16.3.3",
     "@types/aos": "^3.0.7",
     "@types/js-cookie": "^3.0.6",
     "@types/node": "^22.5.4",
@@ -139,10 +146,12 @@
     "@types/react-dom": "^19.0.3",
     "@vitejs/plugin-basic-ssl": "^2.3.0",
     "@vitejs/plugin-react": "^6.0.1",
+    "@vitest/coverage-v8": "^5.0.0",
     "babel-plugin-react-compiler": "^1.0.0",
     "codama": "^1.6.0",
     "gifsicle": "^7.0.1",
     "husky": "^9.1.7",
+    "jsdom": "^30.0.1",
     "lint-staged": "^16.4.0",
     "orval": "^8.5.3",
     "shadcn": "^4.1.1",
@@ -152,6 +161,7 @@
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vite": "^8.0.1",
-    "vite-plugin-react-click-to-component": "^4.2.1"
+    "vite-plugin-react-click-to-component": "^4.2.1",
+    "vitest": "^5.0.0"
   }
 }

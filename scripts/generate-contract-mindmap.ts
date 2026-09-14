@@ -125,12 +125,3 @@ const svg = buildMindMapSvg(buildContractMindMap(), 'Contract Mind Map');
 mkdirSync(dirname(outputPath), { recursive: true });
 writeFileSync(outputPath, svg, 'utf8');
 console.log('SVG generated at docs/contract-mindmap.svg');
-
-
-
-DashboardPreviewSectionHeader
-
-DashboardPreviewSectionHeader
-
-
-dsadsadhk
